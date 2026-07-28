@@ -8,6 +8,7 @@ ever passes is indistinguishable from one that is not running.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -196,8 +197,12 @@ def test_module_entrypoint_runs():
         [sys.executable, "-m", "maxwell_lint.cli", "demo",
          "--sizes", "6", "--pitches", "80", "--json"],
         capture_output=True, text=True,
-        env={"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-             "PATH": "/usr/bin:/bin"},
+        env={**os.environ,
+             # Inherit the OS environment and override only PYTHONPATH.
+             # A scrubbed env is not portable: on Windows, Python needs
+             # SYSTEMROOT to seed its hash randomisation and aborts
+             # without it.
+             "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
     )
     assert r.returncode in (0, 1), r.stderr
     assert "closure" in json.loads(r.stdout)
