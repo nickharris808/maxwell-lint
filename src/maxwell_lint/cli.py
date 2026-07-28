@@ -22,12 +22,14 @@ import argparse
 import importlib
 import json
 import sys
+from pathlib import Path
 
 import numpy as np
 
 from . import __version__
 from .ceiling import check_ceiling
 from .models import (
+    Layout,
     born_second_order,
     isolated_pair_matrix,
     mean_field,
@@ -50,13 +52,86 @@ def _c(t: str, col: str, use: bool) -> str:
 
 def _load_extractor(spec: str):
     if ":" not in spec:
-        raise ValueError(f"expected 'module:function', got {spec!r}")
+        raise ValueError(
+            f"expected 'module:function', got {spec!r} -- e.g. "
+            "--extractor myproject.extract:coupling_matrix"
+        )
     mod_name, fn_name = spec.split(":", 1)
-    mod = importlib.import_module(mod_name)
+    # A console script puts its own directory on sys.path, not the working
+    # directory, so `--extractor myextract:f` for a myextract.py sitting right
+    # there would fail with a bare ImportError. Look in cwd too.
+    if "" not in sys.path and str(Path.cwd()) not in sys.path:
+        sys.path.insert(0, str(Path.cwd()))
+    try:
+        mod = importlib.import_module(mod_name)
+    except ImportError as exc:
+        raise ValueError(
+            f"cannot import {mod_name!r}: {exc}. It must be importable from "
+            f"{Path.cwd()} or installed in this environment -- check the name, "
+            "or run from the directory that contains it."
+        ) from exc
     fn = getattr(mod, fn_name, None)
-    if fn is None or not callable(fn):
-        raise ValueError(f"{mod_name} has no callable {fn_name!r}")
+    if fn is None:
+        near = [a for a in dir(mod) if not a.startswith("_") and callable(getattr(mod, a))]
+        hint = f" It does define: {', '.join(near[:6])}." if near else ""
+        raise ValueError(f"{mod_name} has no attribute {fn_name!r}.{hint}")
+    if not callable(fn):
+        raise ValueError(f"{mod_name}.{fn_name} is not callable (it is a {type(fn).__name__})")
     return fn
+
+
+def _read_matrix(path: str) -> np.ndarray:
+    """Read a square matrix from .npy or a delimited text file."""
+    p = Path(path)
+    if not p.exists():
+        raise ValueError(f"no such file: {p}")
+    if p.suffix.lower() == ".npy":
+        m = np.load(p)
+    else:
+        try:
+            m = np.loadtxt(p, delimiter="," if "," in p.read_text(
+                encoding="utf-8", errors="replace") else None)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                f"{p.name}: could not read as a numeric matrix ({exc}). "
+                "Expected .npy, or text with one row per line and values "
+                "separated by commas or whitespace."
+            ) from exc
+    m = np.asarray(m, dtype=float)
+    if m.ndim != 2 or m.shape[0] != m.shape[1]:
+        raise ValueError(
+            f"{p.name}: expected a square (N, N) matrix, got shape {m.shape}. "
+            "Each row is one conductor's coupling to every conductor."
+        )
+    if not np.all(np.isfinite(m)):
+        n_bad = int(np.count_nonzero(~np.isfinite(m)))
+        raise ValueError(
+            f"{p.name}: {n_bad} non-finite value(s) (NaN/Inf). Refusing to "
+            "check -- a ceiling verdict computed on NaN is not a verdict."
+        )
+    return m
+
+
+def _read_layout(path: str, eps_r: float) -> "Layout":
+    """Read conductor geometry: one row of `x_um, y_um, radius_um` per conductor."""
+    p = Path(path)
+    if not p.exists():
+        raise ValueError(f"no such file: {p}")
+    try:
+        raw = np.loadtxt(p, delimiter="," if "," in p.read_text(
+            encoding="utf-8", errors="replace") else None, ndmin=2)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{p.name}: could not read as numbers ({exc})") from exc
+    if raw.ndim != 2 or raw.shape[1] != 3:
+        raise ValueError(
+            f"{p.name}: expected 3 columns (x_um, y_um, radius_um), got shape "
+            f"{raw.shape}. One row per conductor."
+        )
+    if not np.all(np.isfinite(raw)):
+        raise ValueError(f"{p.name}: contains non-finite values")
+    if np.any(raw[:, 2] <= 0):
+        raise ValueError(f"{p.name}: every radius must be positive")
+    return Layout(raw[:, :2] * 1e-6, raw[:, 2] * 1e-6, eps_r=eps_r)
 
 
 def _run(fn, sizes, pitches, seed, diameter, tol):
@@ -75,8 +150,20 @@ def main(argv: list[str] | None = None) -> int:
         prog="maxwell-lint",
         description="Does your coupling extractor predict physics that cannot exist?",
     )
-    p.add_argument("mode", choices=["demo", "check"], help="demo = built-in models")
+    p.add_argument("mode", choices=["demo", "check", "matrix"],
+                   help="demo = built-in models; check = your extractor; "
+                        "matrix = a coupling matrix you already have")
     p.add_argument("--extractor", help="dotted path module:function (check mode)")
+    p.add_argument("--full", metavar="FILE",
+                   help="matrix mode: your extractor's (N, N) coupling matrix "
+                        "(.npy, or text with commas/whitespace)")
+    p.add_argument("--isolated", metavar="FILE",
+                   help="matrix mode: the isolated-pair reference matrix, same shape")
+    p.add_argument("--layout", metavar="FILE",
+                   help="matrix mode: conductor geometry, rows of x_um,y_um,radius_um; "
+                        "the isolated-pair reference is computed from it")
+    p.add_argument("--eps-r", type=float, default=4.6,
+                   help="relative permittivity used with --layout (default 4.6)")
     p.add_argument("--sizes", default="6,8,12", help="conductor counts, comma-separated")
     p.add_argument("--pitches", default="60,80,100", help="pitches in um, comma-separated")
     p.add_argument("--diameter", type=float, default=40.0, help="conductor diameter in um")
@@ -114,6 +201,59 @@ def main(argv: list[str] | None = None) -> int:
             print(_c("  between two others cannot increase their coupling.", DIM, use))
         any_bad = any(r["n_violations"] for rows in out.values() for r in rows)
         return 1 if any_bad else 0
+
+    if args.mode == "matrix":
+        if not args.full:
+            p.error("matrix mode requires --full FILE (your coupling matrix)")
+        # The ceiling is a ratio, so it needs a reference. Without one there is
+        # no verdict to give -- refuse rather than invent a comparison.
+        if not (args.isolated or args.layout):
+            p.error(
+                "matrix mode needs a reference for the ratio k = |C_full|/|C_iso|: "
+                "pass --isolated FILE if your tool produced the isolated-pair "
+                "matrix, or --layout FILE (x_um,y_um,radius_um per conductor) to "
+                "compute it here. There is no verdict without one."
+            )
+        if args.isolated and args.layout:
+            p.error("pass either --isolated or --layout, not both")
+        try:
+            full = _read_matrix(args.full)
+            if args.isolated:
+                iso = _read_matrix(args.isolated)
+                source = f"--isolated {args.isolated}"
+            else:
+                lay = _read_layout(args.layout, args.eps_r)
+                if lay.n != full.shape[0]:
+                    raise ValueError(
+                        f"--layout has {lay.n} conductor(s) but --full is "
+                        f"{full.shape[0]}x{full.shape[0]}; they must agree"
+                    )
+                iso = isolated_pair_matrix(lay)
+                source = f"--layout {args.layout} (eps_r={args.eps_r:g})"
+            if full.shape != iso.shape:
+                raise ValueError(
+                    f"shape mismatch: --full is {full.shape}, reference is "
+                    f"{iso.shape}. Both must be (N, N) over the same conductors."
+                )
+            rep = check_ceiling(full, iso, tol=args.tol)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+        if args.json:
+            print(json.dumps({"full": args.full, "reference": source,
+                              **rep.as_dict()}, indent=2))
+        else:
+            tag = _c("PASS", GREEN, use) if rep.passed else _c("FAIL", RED, use)
+            print(f"[{tag}] {args.full}: {rep.n_violations}/{rep.n_pairs} pairs "
+                  f"violate the ceiling, max k = {rep.max_k:.4f}")
+            print(_c(f"       reference: {source}", DIM, use))
+            if rep.worst_pair is not None and not rep.passed:
+                i, j = rep.worst_pair
+                print(_c(f"       worst pair: ({i}, {j})", DIM, use))
+                print(_c("       A predicted k > 1 is anti-screening, which no passive "
+                         "arrangement of conductors can produce.", DIM, use))
+        return 1 if rep.n_violations else 0
 
     if not args.extractor:
         p.error("check mode requires --extractor module:function")

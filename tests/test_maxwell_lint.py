@@ -7,8 +7,11 @@ ever passes is indistinguishable from one that is not running.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import pathlib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -253,3 +256,92 @@ def test_pypi_install_lines_are_labelled_as_not_yet_available():
             "README shows `pip install maxwell-lint` without saying the name "
             "is not published yet"
         )
+
+
+# -------------------------------------------- matrix mode + documentation
+
+_EX = _REPO / "examples"
+
+
+def _run_cli(argv):
+    buf = io.StringIO()
+    old, sys.stdout = sys.stdout, buf
+    try:
+        rc = cli_main(argv)
+    finally:
+        sys.stdout = old
+    return rc, buf.getvalue()
+
+
+def test_matrix_mode_agrees_with_both_ways_of_giving_the_reference():
+    """--layout computes the isolated matrix; --isolated supplies it. Same verdict."""
+    rc_a, out_a = _run_cli(["matrix", "--full", str(_EX / "born2.csv"),
+                            "--layout", str(_EX / "geometry.csv"), "--json"])
+    rc_b, out_b = _run_cli(["matrix", "--full", str(_EX / "born2.csv"),
+                            "--isolated", str(_EX / "isolated.csv"), "--json"])
+    a, b = json.loads(out_a), json.loads(out_b)
+    assert rc_a == rc_b == 1
+    assert a["n_violations"] == b["n_violations"]
+    assert a["max_k"] == pytest.approx(b["max_k"], rel=1e-12)
+
+
+def test_matrix_mode_refuses_without_a_reference():
+    """k is a ratio. No denominator, no verdict -- and no guess."""
+    with pytest.raises(SystemExit) as exc:
+        _run_cli(["matrix", "--full", str(_EX / "born2.csv")])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("name,expect_rc", [("closure.csv", 0), ("born2.csv", 1)])
+def test_readme_matrix_transcript_is_real_output(name, expect_rc):
+    readme = (_REPO / "README.md").read_text(encoding="utf-8")
+    cmd = f"$ maxwell-lint matrix --full examples/{name} --layout examples/geometry.csv\n"
+    documented = readme.split(cmd, 1)[1].split("\n$", 1)[0].split("```", 1)[0].strip()
+    rc, out = _run_cli(["matrix", "--full", f"examples/{name}",
+                        "--layout", "examples/geometry.csv", "--no-colour"])
+    assert rc == expect_rc
+    assert out.strip() == documented, f"transcript for {name} drifted from the code"
+
+
+def test_example_matrices_regenerate_identically():
+    """A fixture nobody can rebuild is a fixture nobody can trust."""
+    import numpy as np
+
+    from maxwell_lint.models import (
+        born_second_order,
+        isolated_pair_matrix,
+        monopole_closure,
+        random_layout,
+    )
+    lay = random_layout(8, seed=1, pitch_um=60.0, diameter_um=40.0)
+    for name, arr in [("closure.csv", monopole_closure(lay)),
+                      ("born2.csv", born_second_order(lay)),
+                      ("isolated.csv", isolated_pair_matrix(lay))]:
+        on_disk = np.loadtxt(_EX / name, delimiter=",")
+        assert on_disk == pytest.approx(arr, rel=1e-10), f"{name} is stale"
+
+
+def test_readme_cli_reference_covers_every_flag():
+    import maxwell_lint.cli as cli
+    src = pathlib.Path(cli.__file__).read_text(encoding="utf-8")
+    flags = set(re.findall(r'p\.add_argument\("(--[a-z-]+)"', src))
+    assert flags, "no flags found -- this guard has stopped looking"
+    table = (_REPO / "README.md").read_text(encoding="utf-8").split(
+        "## CLI reference", 1)[1].split("## Troubleshooting", 1)[0]
+    for flag in flags:
+        assert flag in table, f"{flag} exists but the CLI reference omits it"
+
+
+def test_readme_api_table_names_only_real_objects():
+    import maxwell_lint as M
+    for name in ("Layout", "random_layout", "isolated_pair_matrix",
+                 "monopole_closure", "born_second_order", "mean_field",
+                 "screening_factor", "screening_depth", "pairwise_error",
+                 "check_ceiling"):
+        assert hasattr(M, name), f"README promises maxwell_lint.{name}"
+    rep = M.check_ceiling(M.monopole_closure(M.random_layout(6, seed=0)),
+                          M.isolated_pair_matrix(M.random_layout(6, seed=0)))
+    for attr in ("n_pairs", "n_violations", "violation_fraction", "max_k",
+                 "worst_pair", "median_depth", "median_pairwise_error",
+                 "passed", "tol", "as_dict", "summary"):
+        assert hasattr(rep, attr), f"README promises CeilingReport.{attr}"
