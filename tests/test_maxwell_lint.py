@@ -18,13 +18,18 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from maxwell_lint import (  # noqa: E402
-    born_second_order, check_ceiling, isolated_pair_matrix, mean_field,
-    monopole_closure, pairwise_error, random_layout, screening_depth,
+    born_second_order,
+    check_ceiling,
+    isolated_pair_matrix,
+    mean_field,
+    monopole_closure,
+    pairwise_error,
+    random_layout,
+    screening_depth,
     screening_factor,
 )
 from maxwell_lint.cli import main as cli_main  # noqa: E402
 from maxwell_lint.models import Layout  # noqa: E402
-
 
 # ------------------------------------------------------------------ the ceiling
 
