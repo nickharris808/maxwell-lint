@@ -213,6 +213,6 @@ def test_module_entrypoint_runs():
 def test_package_imports_nothing_private():
     root = Path(__file__).resolve().parents[1] / "src"
     for py in root.rglob("*.py"):
-        text = py.read_text()
+        text = py.read_text(encoding="utf-8")
         for forbidden in ("import genesis", "from genesis", "provisionals"):
             assert forbidden not in text, f"{py.name} references private tree: {forbidden}"
