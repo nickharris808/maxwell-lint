@@ -412,3 +412,94 @@ def test_unequal_radii_are_not_collapsed():
     lay = Layout(xy, np.array([20e-6, 5e-6]))
     assert isolated_pair_matrix(lay) == pytest.approx(
         _isolated_pair_matrix_by_explicit_inverse(lay), rel=0, abs=1e-24)
+
+
+# --------------------------------------------- coupling proxy from an S-matrix
+
+def _write_sNp(tmp_path, name, mag, n_freq=3):
+    tt = pytest.importorskip("touchstone_tools")
+    n = mag.shape[0]
+    f = np.linspace(1e9, 10e9, n_freq)
+    s = np.zeros((n_freq, n, n), complex)
+    for i in range(n_freq):
+        s[i] = mag
+    return tt.write_touchstone(tt.Network(freq_hz=f, s=s, z0=50.0),
+                               tmp_path / name)
+
+
+def _sym(n, seed=0, scale=1.0):
+    rng = np.random.default_rng(seed)
+    m = rng.uniform(0.05, 0.3, (n, n))
+    m = (m + m.T) / 2 * scale
+    np.fill_diagonal(m, 0.1)
+    return m
+
+
+def test_from_touchstone_derives_a_proxy_and_finds_no_violation(tmp_path):
+    pytest.importorskip("touchstone_tools")
+    from maxwell_lint.cli import _coupling_from_touchstone
+    base = _sym(4, seed=0)
+    p = _write_sNp(tmp_path, "array.s4p", base * 0.6)
+    m, label = _coupling_from_touchstone(str(p), None)
+    assert m.shape == (4, 4)
+    assert np.all(np.diag(m) == 0.0), "a self term is not a coupling"
+    assert "|S| at" in label, "the label must say what the proxy is"
+
+
+def test_from_touchstone_catches_anti_screening(tmp_path):
+    pytest.importorskip("touchstone_tools")
+    from maxwell_lint.cli import _coupling_from_touchstone
+    base = _sym(4, seed=0)
+    iso, _ = _coupling_from_touchstone(str(_write_sNp(tmp_path, "iso.s4p", base)), None)
+    bad = base * 0.6
+    bad[0, 1] = bad[1, 0] = base[0, 1] * 1.4
+    full, _ = _coupling_from_touchstone(str(_write_sNp(tmp_path, "bad.s4p", bad)), None)
+    rep = check_ceiling(full, iso)
+    assert rep.n_violations == 2 and not rep.passed
+    assert rep.max_k == pytest.approx(1.4, rel=1e-9)
+
+
+def test_layout_reference_is_refused_for_an_s_derived_proxy(tmp_path):
+    """|S| and capacitance are different quantities; their ratio means nothing."""
+    pytest.importorskip("touchstone_tools")
+    p = _write_sNp(tmp_path, "a.s4p", _sym(4))
+    with pytest.raises(SystemExit) as exc:
+        cli_main(["matrix", "--from-touchstone", str(p),
+                  "--layout", str(_EX / "geometry.csv")])
+    assert exc.value.code == 2
+
+
+def test_a_frequency_not_in_the_file_is_refused_not_snapped(tmp_path):
+    """Snapping silently would answer a question the user did not ask."""
+    pytest.importorskip("touchstone_tools")
+    from maxwell_lint.cli import _coupling_from_touchstone
+    p = _write_sNp(tmp_path, "a.s4p", _sym(4))
+    with pytest.raises(ValueError, match="no sample near"):
+        _coupling_from_touchstone(str(p), 3e9)
+    # A frequency that *is* in the file works.
+    m, label = _coupling_from_touchstone(str(p), 1e9)
+    assert "1 GHz" in label
+
+
+def test_a_one_port_file_cannot_yield_a_coupling_matrix(tmp_path):
+    pytest.importorskip("touchstone_tools")
+    p = _write_sNp(tmp_path, "one.s1p", np.array([[0.2]]))
+    from maxwell_lint.cli import _coupling_from_touchstone
+    with pytest.raises(ValueError, match="at least 2 ports"):
+        _coupling_from_touchstone(str(p), None)
+
+
+def test_missing_touchstone_tools_gives_an_install_hint(monkeypatch):
+    """The first failure a user hits must be actionable."""
+    import builtins
+    real = builtins.__import__
+
+    def blocked(name, *a, **k):
+        if name.startswith("touchstone_tools"):
+            raise ImportError("no module named touchstone_tools")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    from maxwell_lint.cli import _coupling_from_touchstone
+    with pytest.raises(ValueError, match=r"pip install git\+"):
+        _coupling_from_touchstone("anything.s2p", None)

@@ -134,6 +134,64 @@ def _read_layout(path: str, eps_r: float) -> "Layout":
     return Layout(raw[:, :2] * 1e-6, raw[:, 2] * 1e-6, eps_r=eps_r)
 
 
+def _coupling_from_touchstone(path: str, freq_hz: float | None):
+    """Derive a coupling *proxy* from an N-port S-matrix.
+
+    What this is: |S_ij| at one frequency, which is the transmitted magnitude
+    between ports i and j -- a monotone stand-in for how strongly they couple.
+
+    What this is **not**: a capacitance extraction. It carries the network's
+    loss, its reference plane and its port impedances along with the coupling,
+    so its absolute scale is not C_ij and comparing it to an isolated-pair
+    capacitance reference is meaningless. The only defensible use is against a
+    reference derived the *same* way -- an isolated-pair S-matrix -- which is
+    why this path requires --isolated and refuses --layout.
+
+    Returns (matrix, label). Raises ValueError with an install hint if
+    touchstone-tools is absent.
+    """
+    try:
+        from touchstone_tools import TouchstoneError, read_touchstone
+    except ImportError as exc:
+        raise ValueError(
+            "--from-touchstone needs the touchstone-tools package:\n\n"
+            "    pip install git+https://github.com/nickharris808/"
+            "touchstone-tools.git@main\n"
+        ) from exc
+
+    try:
+        net = read_touchstone(path)
+    except TouchstoneError as exc:
+        raise ValueError(str(exc)) from exc
+
+    if net.kind != "s":
+        raise ValueError(
+            f"{path}: this path expects S-parameters, got {net.kind.upper()}. "
+            "Convert first with `touchstone-tools convert`."
+        )
+    if net.n_ports < 2:
+        raise ValueError(f"{path}: a coupling matrix needs at least 2 ports")
+
+    if freq_hz is None:
+        idx = 0
+    else:
+        idx = int(np.argmin(np.abs(net.freq_hz - freq_hz)))
+        chosen = net.freq_hz[idx]
+        # Silently snapping to a far-away frequency would answer a question
+        # the user did not ask.
+        if abs(chosen - freq_hz) > 0.01 * max(freq_hz, 1.0):
+            raise ValueError(
+                f"{path}: no sample near {freq_hz / 1e9:g} GHz; the closest is "
+                f"{chosen / 1e9:g} GHz. Pick a frequency in the file rather "
+                "than one this would have to guess at."
+            )
+
+    m = np.abs(net.s[idx]).astype(float)
+    np.fill_diagonal(m, 0.0)   # a self term is not a coupling
+    label = f"{path} (|S| at {net.freq_hz[idx] / 1e9:g} GHz)"
+    return m, label
+
+
 def _run(fn, sizes, pitches, seed, diameter, tol):
     rows = []
     for n in sizes:
@@ -159,6 +217,14 @@ def main(argv: list[str] | None = None) -> int:
                         "(.npy, or text with commas/whitespace)")
     p.add_argument("--isolated", metavar="FILE",
                    help="matrix mode: the isolated-pair reference matrix, same shape")
+    p.add_argument("--from-touchstone", metavar="FILE", dest="from_touchstone",
+                   help="matrix mode: derive a coupling proxy from an N-port "
+                        "S-matrix instead of passing --full. Requires "
+                        "touchstone-tools. See the README for what this proxy "
+                        "is and is not.")
+    p.add_argument("--freq-hz", type=float, default=None,
+                   help="with --from-touchstone: the frequency to evaluate at "
+                        "(default: the lowest in the file)")
     p.add_argument("--layout", metavar="FILE",
                    help="matrix mode: conductor geometry, rows of x_um,y_um,radius_um; "
                         "the isolated-pair reference is computed from it")
@@ -203,8 +269,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if any_bad else 0
 
     if args.mode == "matrix":
-        if not args.full:
-            p.error("matrix mode requires --full FILE (your coupling matrix)")
+        if args.full and args.from_touchstone:
+            p.error("pass either --full or --from-touchstone, not both")
+        if args.from_touchstone:
+            try:
+                full, src_label = _coupling_from_touchstone(
+                    args.from_touchstone, args.freq_hz)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            args.full = src_label
+        elif not args.full:
+            p.error("matrix mode requires --full FILE (your coupling matrix), "
+                    "or --from-touchstone FILE to derive one from an S-matrix")
         # The ceiling is a ratio, so it needs a reference. Without one there is
         # no verdict to give -- refuse rather than invent a comparison.
         if not (args.isolated or args.layout):
@@ -216,8 +293,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.isolated and args.layout:
             p.error("pass either --isolated or --layout, not both")
+        if args.from_touchstone and args.layout:
+            p.error(
+                "--from-touchstone yields |S|, a transmitted-magnitude proxy, "
+                "while --layout computes an isolated-pair *capacitance*. Those "
+                "are different quantities and their ratio means nothing. Use "
+                "--isolated with an isolated-pair S-matrix measured or "
+                "simulated the same way."
+            )
         try:
-            full = _read_matrix(args.full)
+            if not args.from_touchstone:
+                full = _read_matrix(args.full)
             if args.isolated:
                 iso = _read_matrix(args.isolated)
                 source = f"--isolated {args.isolated}"
