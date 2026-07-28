@@ -345,3 +345,70 @@ def test_readme_api_table_names_only_real_objects():
                  "worst_pair", "median_depth", "median_pairwise_error",
                  "passed", "tol", "as_dict", "summary"):
         assert hasattr(rep, attr), f"README promises CeilingReport.{attr}"
+
+
+# ------------------------------------------------ vectorized isolated pairs
+
+def _isolated_pair_matrix_by_explicit_inverse(lay):
+    """The pre-vectorization implementation, kept as the equivalence oracle.
+
+    It builds each pair's 2x2 potential matrix and inverts it with
+    ``np.linalg.inv``. Slow, but obviously correct -- which is exactly what an
+    oracle is for.
+    """
+    from maxwell_lint.models import EPS0
+    n = lay.n
+    out = np.zeros((n, n))
+    d = lay.distances()
+    scale = 1.0 / (2.0 * np.pi * EPS0 * lay.eps_r)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            p = np.array([
+                [-scale * np.log(lay.radius[i]), -scale * np.log(d[i, j])],
+                [-scale * np.log(d[i, j]), -scale * np.log(lay.radius[j])],
+            ])
+            out[i, j] = abs(np.linalg.inv(p)[0, 1])
+    return out
+
+
+@pytest.mark.parametrize("n", [2, 3, 8, 33])
+def test_isolated_pair_matrix_matches_the_explicit_two_by_two_inverse(n):
+    """The closed form must equal the inverse it replaces, not merely track it."""
+    lay = random_layout(n, seed=n)
+    fast = isolated_pair_matrix(lay)
+    slow = _isolated_pair_matrix_by_explicit_inverse(lay)
+    assert fast.shape == slow.shape
+    assert np.allclose(fast, slow, rtol=0, atol=1e-24), (
+        f"worst absolute difference {np.max(np.abs(fast - slow)):.3e}"
+    )
+
+
+def test_isolated_pair_matrix_is_finite_and_has_a_zero_diagonal():
+    """A conductor is not coupled to itself, and no inf/nan may escape.
+
+    The vectorized form divides by a determinant that is -inf on the diagonal,
+    so the diagonal has to be written rather than merely inherited.
+    """
+    lay = random_layout(12, seed=3)
+    m = isolated_pair_matrix(lay)
+    assert np.isfinite(m).all(), "non-finite value leaked out of the closed form"
+    assert np.all(np.diag(m) == 0.0)
+    assert np.all(m >= 0.0)
+
+
+def test_isolated_pair_matrix_is_symmetric():
+    """Pair (i,j) and (j,i) see the same two conductors, so must agree."""
+    lay = random_layout(9, seed=5)
+    m = isolated_pair_matrix(lay)
+    assert np.allclose(m, m.T, rtol=0, atol=1e-24)
+
+
+def test_unequal_radii_are_not_collapsed():
+    """The closed form uses r_i and r_j separately; a bug could use one twice."""
+    from maxwell_lint.models import Layout
+    xy = np.array([[0.0, 0.0], [100e-6, 0.0]])
+    lay = Layout(xy, np.array([20e-6, 5e-6]))
+    assert isolated_pair_matrix(lay) == pytest.approx(
+        _isolated_pair_matrix_by_explicit_inverse(lay), rel=0, abs=1e-24)
